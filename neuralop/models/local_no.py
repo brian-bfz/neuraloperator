@@ -196,7 +196,7 @@ class LocalNO(BaseModel, name="LocalNO"):
         disco_layers: Union[bool, List[bool]] = True,
         disco_kernel_shape: List[int] = [2, 4],
         radius_cutoff: bool = None,
-        domain_length: List[int] = [2, 2],
+        domain_length: List[int] = None,
         disco_groups: int = 1,
         disco_bias: bool = True,
         diff_layers: Union[bool, List[bool]] = True,
@@ -231,6 +231,9 @@ class LocalNO(BaseModel, name="LocalNO"):
     ):
         super().__init__()
         self.n_dim = len(n_modes)
+
+        if domain_length is None:
+            domain_length = [2] * self.n_dim
 
         # n_modes is a special property - see the class' property for underlying mechanism
         # When updated, change should be reflected in local_no blocks

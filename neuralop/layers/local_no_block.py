@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from .channel_mlp import ChannelMLP
 from .fno_block import SubModule
 from .differential_conv import FiniteDifferenceConvolution
-from .discrete_continuous_convolution import EquidistantDiscreteContinuousConv2d
+from .discrete_continuous_convolution import EquidistantDiscreteContinuousConv2d, EquidistantDiscreteContinuousConv3d
 from .normalization_layers import AdaIN, InstanceNorm
 from .skip_connections import skip_connection
 from .spectral_convolution import SpectralConv
@@ -138,7 +138,7 @@ class LocalNOBlocks(nn.Module):
     Notes
     -----
     - Differential kernels are only implemented for dimensions ≤ 3
-    - Local integral kernels are only implemented for 2D domains
+    - Local integral kernels are implemented for 2D and 3D domains
 
     References
     ----------
@@ -208,8 +208,8 @@ class LocalNOBlocks(nn.Module):
         if len(n_modes) > 3 and True in diff_layers:
             raise NotImplementedError("Differential convs not implemented for dimensions higher than 3.")
 
-        if len(n_modes) != 2 and True in disco_layers:
-            raise NotImplementedError("Local conv layers only implemented for dimension 2.")
+        if len(n_modes) not in (2, 3) and True in disco_layers:
+            raise NotImplementedError("Local conv layers only implemented for dimensions 2 and 3.")
             
         if conv_padding_mode not in ['circular', 'periodic', 'zeros'] and True in disco_layers:
             warnings.warn("Local conv layers only support periodic or zero padding, defaulting to zero padding for local convs.")
@@ -327,9 +327,10 @@ class LocalNOBlocks(nn.Module):
             ]
         )
 
+        disco_conv_class = EquidistantDiscreteContinuousConv3d if self.n_dim == 3 else EquidistantDiscreteContinuousConv2d
         self.local_convs = nn.ModuleList(
             [
-                EquidistantDiscreteContinuousConv2d(
+                disco_conv_class(
                     self.in_channels,
                     self.out_channels,
                     in_shape=self.default_in_shape,
