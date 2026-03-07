@@ -9,15 +9,16 @@ import os
 from typing import Union, Optional, Literal
 
 # import the base class from torch-harmonics
-try:
-    from torch_harmonics.quadrature import _precompute_grid
-    from torch_harmonics.filter_basis import (
+from .filter_basis import (
         PiecewiseLinearFilterBasis,
         PiecewiseLinearFilterBasis3d,
         MorletFilterBasis,
         MorletFilterBasis3d,
         ZernikeFilterBasis,
     )
+
+try:
+    from torch_harmonics.quadrature import _precompute_grid
 except ModuleNotFoundError:
     print(
         "Error: trying to import DISCO convolutions without optional dependency torch-harmonics. ",
@@ -1086,10 +1087,10 @@ class EquidistantDiscreteContinuousConvTranspose2d(DiscreteContinuousConv):
 
         # compute how big the discrete kernel needs to be for the 2d convolution kernel to work
         self.psi_local_h = (
-            math.floor(2 * radius_cutoff * out_shape[0] / self.domain_length[0]) + 1
+            2 * math.floor(radius_cutoff * out_shape[0] / self.domain_length[0]) + 1
         )
         self.psi_local_w = (
-            math.floor(2 * radius_cutoff * out_shape[1] / self.domain_length[1]) + 1
+            2 * math.floor(radius_cutoff * out_shape[1] / self.domain_length[1]) + 1
         )
 
         # compute the scale_factor
@@ -1274,13 +1275,13 @@ class EquidistantDiscreteContinuousConv3d(DiscreteContinuousConv):
 
         # Compute discrete support window sizes (3D analogue of psi_local_h/w)
         self.psi_local_d = (
-            math.floor(2 * radius_cutoff * in_shape[0] / self.domain_length[0]) + 1
+            2 * math.floor(radius_cutoff * in_shape[0] / self.domain_length[0]) + 1
         )
         self.psi_local_h = (
-            math.floor(2 * radius_cutoff * in_shape[1] / self.domain_length[1]) + 1
+            2 * math.floor(radius_cutoff * in_shape[1] / self.domain_length[1]) + 1
         )
         self.psi_local_w = (
-            math.floor(2 * radius_cutoff * in_shape[2] / self.domain_length[2]) + 1
+            2 * math.floor(radius_cutoff * in_shape[2] / self.domain_length[2]) + 1
         )
 
         # Compute scale factors just like 2D version

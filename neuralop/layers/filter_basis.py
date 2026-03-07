@@ -1,0 +1,674 @@
+# coding=utf-8
+
+# SPDX-FileCopyrightText: Copyright (c) 2022 The torch-harmonics Authors. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+import abc
+from typing import Tuple, Union, Optional
+import math
+from typing_extensions import override
+
+import torch
+
+from torch_harmonics.cache import lru_cache
+
+
+def _circle_dist(x1: torch.Tensor, x2: torch.Tensor):
+    """Helper function to compute the distance on a circle"""
+    return torch.minimum(torch.abs(x1 - x2), torch.abs(2 * math.pi - torch.abs(x1 - x2)))
+
+
+def _log_factorial(x: torch.Tensor):
+    """Helper function to compute the log factorial on a torch tensor"""
+    return torch.lgamma(x + 1)
+
+
+def _factorial(x: torch.Tensor):
+    """Helper function to compute the factorial on a torch tensor"""
+    return torch.exp(_log_factorial(x))
+
+
+class FilterBasis(metaclass=abc.ABCMeta):
+    """
+    Abstract base class for a filter basis
+    """
+
+    def __init__(
+        self,
+        kernel_shape: Union[int, Tuple[int], Tuple[int, int], Tuple[int, int, int]],
+    ):
+
+        self.kernel_shape = kernel_shape
+
+    @property
+    @abc.abstractmethod
+    def kernel_size(self):
+        raise NotImplementedError
+
+    # @abc.abstractmethod
+    # def compute_vals(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float):
+    #     """
+    #     Computes the values of the filter basis
+    #     """
+    #     raise NotImplementedError
+
+    @abc.abstractmethod
+    def compute_support_vals(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float):
+        """
+        Computes the index set that falls into the kernel's support and returns both indices and values. This routine is designed for sparse evaluations of the filter basis
+        """
+        raise NotImplementedError
+
+class FilterBasis3d(metaclass=abc.ABCMeta):
+    """
+    Abstract base class for a 3D filter basis.
+    """
+
+    def __init__(
+        self,
+        kernel_shape: Union[int, tuple[int, int, int]],
+    ):
+        """
+        Initializes the basis with a 3D kernel shape.
+
+        Args:
+            kernel_shape: The dimensions of the basis function palette.
+                          If an int, creates a cubic shape (k, k, k).
+        """
+        if isinstance(kernel_shape, int):
+            kernel_shape = (kernel_shape, kernel_shape, kernel_shape)
+        if len(kernel_shape) != 3:
+            raise ValueError(f"Expected kernel_shape to be a tuple of 3 but got {kernel_shape} instead.")
+        
+        self.kernel_shape = kernel_shape
+
+    @property
+    @abc.abstractmethod
+    def kernel_size(self) -> int:
+        """
+        The total number of basis functions in the palette.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def compute_support_vals(self, r: torch.Tensor, theta: torch.Tensor, phi: torch.Tensor, r_cutoff: float, width: float = 1.0, **kwargs):
+        """
+        Computes the index set that falls into the kernel's spherical support
+        and returns both indices and values. This routine is designed for
+        sparse evaluations of the filter basis.
+
+        Args:
+            r, theta, phi : tensors of identical shape (D, H, W) or flattened
+            r_cutoff      : radial support limit
+
+        Returns:
+            A tuple containing:
+            - iidx (torch.Tensor): A sparse index map of shape [nnz, 4] where each
+                                   row is (basis_idx, z_idx, y_idx, x_idx).
+            - vals (torch.Tensor): A flat tensor of shape [nnz] containing the
+                                   computed basis values.
+        """
+        raise NotImplementedError
+
+
+@lru_cache(typed=True, copy=False)
+def get_filter_basis(kernel_shape: Union[int, Tuple[int], Tuple[int, int]], basis_type: str) -> FilterBasis:
+    """Factory function to generate the appropriate filter basis"""
+
+    if basis_type == "piecewise linear":
+        return PiecewiseLinearFilterBasis(kernel_shape=kernel_shape)
+    elif basis_type == "morlet":
+        return MorletFilterBasis(kernel_shape=kernel_shape)
+    elif basis_type == "morlet3d":
+        # TODO: replace with better typing
+        return MorletFilterBasis3d(kernel_shape=kernel_shape)
+    elif basis_type == "zernike":
+        return ZernikeFilterBasis(kernel_shape=kernel_shape)
+    else:
+        raise ValueError(f"Unknown basis_type {basis_type}")
+
+
+class PiecewiseLinearFilterBasis(FilterBasis):
+    """
+    Tensor-product basis on a disk constructed from piecewise linear basis functions.
+    """
+
+    def __init__(
+        self,
+        kernel_shape: Union[int, Tuple[int], Tuple[int, int]],
+    ):
+
+        if isinstance(kernel_shape, int):
+            kernel_shape = [kernel_shape]
+        if len(kernel_shape) == 1:
+            kernel_shape = [kernel_shape[0], 1]
+        elif len(kernel_shape) != 2:
+            raise ValueError(f"expected kernel_shape to be a list or tuple of length 1 or 2 but got {kernel_shape} instead.")
+
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    def kernel_size(self):
+        return (self.kernel_shape[0] // 2) * self.kernel_shape[1] + self.kernel_shape[0] % 2
+
+    def _compute_support_vals_isotropic(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float):
+        """
+        Computes the index set that falls into the isotropic kernel's support and returns both indices and values.
+        """
+
+        # enumerator for basis function
+        ikernel = torch.arange(self.kernel_size).reshape(-1, 1, 1)
+
+        # collocation points
+        nr = self.kernel_shape[0]
+        dr = 2 * r_cutoff / (nr + 1)
+
+        # compute the support
+        if nr % 2 == 1:
+            ir = ikernel * dr
+        else:
+            ir = (ikernel + 0.5) * dr
+
+        # find the indices where the rotated position falls into the support of the kernel
+        iidx = torch.argwhere(((r - ir).abs() <= dr) & (r <= r_cutoff))
+        vals = 1 - (r[iidx[:, 1], iidx[:, 2]] - ir[iidx[:, 0], 0, 0]).abs() / dr
+
+        return iidx, vals
+
+    def _compute_support_vals_anisotropic(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float):
+        """
+        Computes the index set that falls into the isotropic kernel's support and returns both indices and values.
+        """
+
+        # enumerator for basis function
+        ikernel = torch.arange(self.kernel_size).reshape(-1, 1, 1)
+
+        # collocation points
+        nr = self.kernel_shape[0]
+        nphi = self.kernel_shape[1]
+        dr = 2 * r_cutoff / (nr + 1)
+        dphi = 2.0 * math.pi / nphi
+
+        # disambiguate even and uneven cases and compute the support
+        if nr % 2 == 1:
+            ir = ((ikernel - 1) // nphi + 1) * dr
+            iphi = ((ikernel - 1) % nphi) * dphi - math.pi
+        else:
+            ir = (ikernel // nphi + 0.5) * dr
+            iphi = (ikernel % nphi) * dphi - math.pi
+
+        # find the indices where the rotated position falls into the support of the kernel
+        if nr % 2 == 1:
+            # find the support
+            cond_r = ((r - ir).abs() <= dr) & (r <= r_cutoff)
+            cond_phi = (ikernel == 0) | (_circle_dist(phi, iphi).abs() <= dphi)
+            # find indices where conditions are met
+            iidx = torch.argwhere(cond_r & cond_phi)
+            # compute the distance to the collocation points
+            dist_r = (r[iidx[:, 1], iidx[:, 2]] - ir[iidx[:, 0], 0, 0]).abs()
+            dist_phi = _circle_dist(phi[iidx[:, 1], iidx[:, 2]], iphi[iidx[:, 0], 0, 0])
+            # compute the value of the basis functions
+            vals = 1 - dist_r / dr
+            vals *= torch.where(
+                (iidx[:, 0] > 0),
+                (1 - dist_phi / dphi),
+                1.0,
+            )
+
+        else:
+            # in the even case, the inner basis functions overlap into areas with a negative areas
+            rn = -r
+            phin = torch.where(phi + math.pi >= math.pi, phi - math.pi, phi + math.pi)
+            # find the support
+            cond_r = ((r - ir).abs() <= dr) & (r <= r_cutoff)
+            cond_phi = _circle_dist(phi, iphi).abs() <= dphi
+            cond_rn = ((rn - ir).abs() <= dr) & (rn <= r_cutoff)
+            cond_phin = _circle_dist(phin, iphi) <= dphi
+            # find indices where conditions are met
+            iidx = torch.argwhere((cond_r & cond_phi) | (cond_rn & cond_phin))
+            dist_r = (r[iidx[:, 1], iidx[:, 2]] - ir[iidx[:, 0], 0, 0]).abs()
+            dist_phi = _circle_dist(phi[iidx[:, 1], iidx[:, 2]], iphi[iidx[:, 0], 0, 0])
+            dist_rn = (rn[iidx[:, 1], iidx[:, 2]] - ir[iidx[:, 0], 0, 0]).abs()
+            dist_phin = _circle_dist(phin[iidx[:, 1], iidx[:, 2]], iphi[iidx[:, 0], 0, 0])
+            # compute the value of the basis functions
+            vals = cond_r[iidx[:, 0], iidx[:, 1], iidx[:, 2]] * (1 - dist_r / dr)
+            vals *= cond_phi[iidx[:, 0], iidx[:, 1], iidx[:, 2]] * (1 - dist_phi / dphi)
+            valsn = cond_rn[iidx[:, 0], iidx[:, 1], iidx[:, 2]] * (1 - dist_rn / dr)
+            valsn *= cond_phin[iidx[:, 0], iidx[:, 1], iidx[:, 2]] * (1 - dist_phin / dphi)
+            vals += valsn
+
+        return iidx, vals
+
+    def compute_support_vals(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float):
+
+        if self.kernel_shape[1] > 1:
+            return self._compute_support_vals_anisotropic(r, phi, r_cutoff=r_cutoff)
+        else:
+            return self._compute_support_vals_isotropic(r, phi, r_cutoff=r_cutoff)
+
+class PiecewiseLinearFilterBasis3d(FilterBasis3d):
+    """
+    3D Piecewise Linear filter basis on a sphere.
+    Tensor-product basis constructed from piecewise linear basis functions
+    along radial and angular (θ, φ) directions.
+
+    This basis approximates separable filters in spherical coordinates
+    (r, θ, φ) using piecewise linear radial and angular terms.
+    """
+
+    def __init__(self, kernel_shape: Union[int, Tuple[int, int, int]]):
+        """
+        Args:
+            kernel_shape: If int, creates cubic shape (k, k, k).
+                          Tuple is (nr, ntheta, nphi).
+        """
+        if isinstance(kernel_shape, int):
+            kernel_shape = (kernel_shape, 1, 1)
+        elif len(kernel_shape) == 2:
+            kernel_shape = (kernel_shape[0], kernel_shape[1], 1)
+        elif len(kernel_shape) != 3:
+            raise ValueError(f"Expected kernel_shape of len 1-3 but got {kernel_shape}.")
+
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    def kernel_size(self):
+        nr, ntheta, nphi = self.kernel_shape
+        return nr * ntheta * nphi
+
+    def _compute_collocation_points(self, r_cutoff: float):
+        """
+        Precompute centers for piecewise linear segments in r, θ, and φ.
+        Ensures bins are interior to valid ranges to avoid edge overflows.
+        """
+        nr, ntheta, nphi = self.kernel_shape
+        dr = r_cutoff / (nr + 1)
+        dtheta = math.pi / ntheta if ntheta > 1 else math.pi
+        dphi = 2 * math.pi / nphi if nphi > 1 else 2 * math.pi
+
+        # Centers of bins shifted inward (avoid including π and −π)
+        ir = torch.arange(1, nr + 1) * dr
+
+        # Slightly shift the angular bins to stay within (0, π) and (−π, π)
+        itheta = torch.linspace(0.0, math.pi, ntheta + 1, dtype=torch.float32)[:-1] + dtheta / 2
+        iphi = torch.linspace(-math.pi, math.pi, nphi + 1, dtype=torch.float32)[:-1] + dphi / 2
+
+        return ir, itheta, iphi, dr, dtheta, dphi
+
+    def compute_support_vals(
+        self,
+        r: torch.Tensor,        # shape [...], radial distances
+        theta: torch.Tensor,    # shape [...], polar angles
+        phi: torch.Tensor,      # shape [...], azimuthal angles
+        r_cutoff: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute sparse index/value pairs for a 3D anisotropic piecewise-linear basis.
+
+        Args:
+            r, theta, phi : tensors of identical shape (D, H, W) or flattened
+            r_cutoff      : radial support limit
+        """
+        # Flatten into [N] vector
+        r_flat = r.reshape(-1)
+        theta_flat = theta.reshape(-1)
+        phi_flat = phi.reshape(-1)
+
+        nr, ntheta, nphi = self.kernel_shape
+        kernel_size = self.kernel_size
+
+        ir, itheta, iphi, dr, dtheta, dphi = self._compute_collocation_points(r_cutoff)
+
+        ir = ir.to(r.device)
+        itheta = itheta.to(r.device)
+        iphi = iphi.to(r.device)
+
+        k = torch.arange(kernel_size, device=r.device)
+
+        kr = k // (ntheta * nphi)
+        ktheta = (k // nphi) % ntheta
+        kphi = k % nphi
+
+        # Expand centers to broadcast with r_flat
+        cr = ir[kr].unsqueeze(1)
+        ctheta = itheta[ktheta].unsqueeze(1)
+        cphi = iphi[kphi].unsqueeze(1)
+
+        # Expand spatial points
+        r_exp = r_flat.unsqueeze(0)
+        theta_exp = theta_flat.unsqueeze(0)
+        phi_exp = phi_flat.unsqueeze(0)
+
+        # Compute distances
+        dist_r = (r_exp - cr).abs()
+        dist_theta = (theta_exp - ctheta).abs()
+
+        # Periodic wrap for phi
+        raw_dphi = (phi_exp - cphi).abs()
+        dist_phi = torch.minimum(raw_dphi, 2*math.pi - raw_dphi)
+
+        # Support condition: radial + angular support
+        cond = (
+            (r_exp <= r_cutoff)
+            & (dist_r <= dr)
+            & (dist_theta <= dtheta)
+            & (dist_phi <= dphi)
+        )  # [K, N]
+
+        # iidx has rows [kernel_index, point_index]
+        iidx = torch.argwhere(cond)
+
+        if iidx.numel() == 0:
+            return iidx, torch.zeros(0, device=r.device)
+
+        # Compute piecewise linear factors for each contributing pair
+        dist_r_sel = dist_r[iidx[:, 0], iidx[:, 1]]
+        dist_theta_sel = dist_theta[iidx[:, 0], iidx[:, 1]]
+        dist_phi_sel = dist_phi[iidx[:, 0], iidx[:, 1]]
+
+        vals_r = 1 - dist_r_sel / dr
+        vals_theta = 1 - dist_theta_sel / dtheta
+        vals_phi = 1 - dist_phi_sel / dphi
+
+        vals = vals_r * vals_theta * vals_phi
+
+        return iidx, vals
+
+class MorletFilterBasis(FilterBasis):
+    """
+    Morlet-style filter basis on the disk. A Gaussian is multiplied with a Fourier basis in x and y directions
+    """
+
+    def __init__(
+        self,
+        kernel_shape: Union[int, Tuple[int], Tuple[int, int]],
+    ):
+
+        if isinstance(kernel_shape, int):
+            kernel_shape = [kernel_shape, kernel_shape]
+        if len(kernel_shape) != 2:
+            raise ValueError(f"expected kernel_shape to be a list or tuple of 2 but got {kernel_shape} instead.")
+
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    def kernel_size(self):
+        return self.kernel_shape[0] * self.kernel_shape[1]
+
+    def gaussian_window(self, r: torch.Tensor, width: float = 1.0):
+        return 1 / (2 * math.pi * width**2) * torch.exp(-0.5 * r**2 / (width**2))
+
+    def hann_window(self, r: torch.Tensor, width: float = 1.0):
+        return torch.cos(0.5 * torch.pi * r / width) ** 2
+
+    def compute_support_vals(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float, width: float = 1.0):
+        """
+        Computes the index set that falls into the isotropic kernel's support and returns both indices and values.
+        """
+
+        # enumerator for basis function
+        ikernel = torch.arange(self.kernel_size).reshape(-1, 1, 1)
+        nkernel = ikernel % self.kernel_shape[1]
+        mkernel = ikernel // self.kernel_shape[1]
+
+        # get relevant indices
+        iidx = torch.argwhere((r <= r_cutoff) & torch.full_like(ikernel, True, dtype=torch.bool))
+
+        # get corresponding r, phi, x and y coordinates
+        r = r[iidx[:, 1], iidx[:, 2]] / r_cutoff
+        phi = phi[iidx[:, 1], iidx[:, 2]]
+        x = r * torch.sin(phi)
+        y = r * torch.cos(phi)
+        n = nkernel[iidx[:, 0], 0, 0]
+        m = mkernel[iidx[:, 0], 0, 0]
+
+        harmonic = torch.where(n % 2 == 1, torch.sin(torch.ceil(n / 2) * math.pi * x / width), torch.cos(torch.ceil(n / 2) * math.pi * x / width))
+        harmonic *= torch.where(m % 2 == 1, torch.sin(torch.ceil(m / 2) * math.pi * y / width), torch.cos(torch.ceil(m / 2) * math.pi * y / width))
+
+        # computes the envelope. To ensure that the curve is roughly 0 at the boundary, we rescale the Gaussian by 0.25
+        # vals = self.gaussian_window(r, width=width) * harmonic
+        vals = self.hann_window(r, width=width) * harmonic
+
+        return iidx, vals
+
+class MorletFilterBasis3d(FilterBasis3d):
+    """
+    3D Morlet-style filter basis on a sphere. A Hann window is
+    multiplied with a Fourier basis in x, y, and z directions.
+    """
+    def __init__(
+        self,
+        kernel_shape: Union[int, Tuple[int, int, int]],
+    ):
+        if isinstance(kernel_shape, tuple) and len(kernel_shape) != 3:
+            raise ValueError(f"Expected kernel_shape to be a tuple of 3 but got {kernel_shape} instead.")
+        if isinstance(kernel_shape, int):
+            kernel_shape = [kernel_shape, kernel_shape, kernel_shape]
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    def kernel_size(self):
+        """Total number of basis functions."""
+        return self.kernel_shape[0] * self.kernel_shape[1] * self.kernel_shape[2]
+
+    def hann_window(self, r: torch.Tensor, width: float = 1.0):
+        # anything outside window gets clamped to width, at which the value is 0 (thus not in the support)
+        r_clamped = torch.clamp(r, 0, width)
+        return torch.cos(0.5 * torch.pi * r_clamped / width) ** 2
+
+    def compute_support_vals(self, r: torch.Tensor, theta: torch.Tensor, phi: torch.Tensor, r_cutoff: float, width: float = 1.0, **kwargs):
+        """
+        Computes the basis functions on a 3D grid within a spherical support.
+        """
+        x = r * torch.sin(theta) * torch.cos(phi)
+        y = r * torch.sin(theta) * torch.sin(phi)
+        z = r * torch.cos(theta)
+
+        K = self.kernel_size
+        
+        ikernel = torch.arange(K, device=r.device).view(-1, 1, 1)
+
+        nkernel = ikernel % self.kernel_shape[2]
+        mkernel = (ikernel // self.kernel_shape[2]) % self.kernel_shape[1]
+        pkernel = ikernel // (self.kernel_shape[2] * self.kernel_shape[1])
+
+        mask = (r <= r_cutoff).unsqueeze(0).expand(K, *r.shape)
+        
+        iidx = torch.argwhere(mask) 
+
+        k_idx = iidx[:, 0]
+        m_idx = iidx[:, 1]
+        n_idx = iidx[:, 2]
+
+        r_sparse = r[m_idx, n_idx] / r_cutoff
+        x_sparse = x[m_idx, n_idx]
+        y_sparse = y[m_idx, n_idx]
+        z_sparse = z[m_idx, n_idx]
+        n_sparse = nkernel[k_idx, 0, 0]
+        m_sparse = mkernel[k_idx, 0, 0]
+        p_sparse = pkernel[k_idx, 0, 0]
+
+        harmonic_x = torch.where(n_sparse % 2 == 1, 
+                                 torch.sin(torch.ceil(n_sparse / 2) * math.pi * x_sparse / width), 
+                                 torch.cos(torch.ceil(n_sparse / 2) * math.pi * x_sparse / width))
+        harmonic_y = torch.where(m_sparse % 2 == 1, 
+                                 torch.sin(torch.ceil(m_sparse / 2) * math.pi * y_sparse / width), 
+                                 torch.cos(torch.ceil(m_sparse / 2) * math.pi * y_sparse / width))
+        harmonic_z = torch.where(p_sparse % 2 == 1, 
+                                 torch.sin(torch.ceil(p_sparse / 2) * math.pi * z_sparse / width), 
+                                 torch.cos(torch.ceil(p_sparse / 2) * math.pi * z_sparse / width))
+
+        harmonic = harmonic_x * harmonic_y * harmonic_z
+        vals = self.hann_window(r_sparse, width=width) * harmonic
+        return iidx.T, vals
+
+
+# class MorletFilterBasis3d(FilterBasis3d):
+#     """
+#     3D Morlet-style filter basis on a sphere. A Hann window is
+#     multiplied with a Fourier basis in x, y, and z directions.
+#     """
+#     def __init__(
+#     self,
+#     kernel_shape: Union[int, Tuple[int, int, int]],
+#     ):
+#         if isinstance(kernel_shape, tuple) and len(kernel_shape) != 3:
+#             raise ValueError(f"Expected kernel_shape to be a tuple of 3 but got {kernel_shape} instead.")
+#         if isinstance(kernel_shape, int):
+#             kernel_shape = [kernel_shape, kernel_shape, kernel_shape]
+#         super().__init__(kernel_shape=kernel_shape)
+
+#     @property
+#     @override
+#     def kernel_size(self):
+#         """Total number of basis functions."""
+#         return self.kernel_shape[0] * self.kernel_shape[1] * self.kernel_shape[2]
+
+#     def hann_window(self, r: torch.Tensor, width: float = 1.0):
+#         # anything outside window gets clamped to width, at which the value is 0 (thus not in the support)
+#         r_clamped = torch.clamp(r, 0, width)
+#         return torch.cos(0.5 * torch.pi * r_clamped / width) ** 2
+
+#     def compute_support_vals(self, grid: torch.Tensor, r_cutoff: float, width: float = 1.0, **kwargs):
+#         """
+#         Computes the basis functions on a 3D grid within a spherical support.
+
+#         Args:
+#             grid (torch.Tensor): A tensor of shape [3, D, H, W] representing the
+#                                  (x, y, z) coordinates of the grid points.
+#             r_cutoff (float): The radius of the spherical support.
+#             width (float): The characteristic width for the Fourier basis.
+#         """
+#         x, y, z = grid[0], grid[1], grid[2]
+#         r = torch.sqrt(x**2 + y**2 + z**2)
+
+#         # Enumerator for each of the basis functions
+#         # Shape: [kernel_size, 1, 1, 1] for broadcasting
+#         ikernel = torch.arange(self.kernel_size, device=grid.device).view(-1, 1, 1, 1)
+#         # Decompose the flat ikernel index into 3D (p, m, n) indices
+#         # n is the fastest changing, for x-direction frequency
+#         nkernel = ikernel % self.kernel_shape[2]
+#         # m is for y-direction frequency
+#         mkernel = (ikernel // self.kernel_shape[2]) % self.kernel_shape[1]
+#         # p is the slowest, for z-direction frequency
+#         pkernel = ikernel // (self.kernel_shape[2] * self.kernel_shape[1])
+
+#         # get relevant indices
+#         iidx = torch.argwhere((r <= r_cutoff) & torch.full_like(ikernel, True, dtype=torch.bool))
+
+#         # get corresponding r, x, y, z coordinates
+#         r_sparse = r[iidx[:, 1], iidx[:, 2], iidx[:, 3]] / r_cutoff
+#         x_sparse = x[iidx[:, 1], iidx[:, 2], iidx[:, 3]]
+#         y_sparse = y[iidx[:, 1], iidx[:, 2], iidx[:, 3]]
+#         z_sparse = z[iidx[:, 1], iidx[:, 2], iidx[:, 3]]
+
+#         n_sparse = nkernel[iidx[:, 0], 0, 0, 0]
+#         m_sparse = mkernel[iidx[:, 0], 0, 0, 0]
+#         p_sparse = pkernel[iidx[:, 0], 0, 0, 0]
+
+#         # Generate the 3D harmonic pattern (separable Fourier basis)
+#         # Use sine for odd indices, cosine for even indices to get different phases
+#         harmonic_x = torch.where(n_sparse % 2 == 1, torch.sin(torch.ceil(n_sparse / 2) * math.pi * x_sparse / width), torch.cos(torch.ceil(n_sparse / 2) * math.pi * x_sparse / width))
+#         harmonic_y = torch.where(m_sparse % 2 == 1, torch.sin(torch.ceil(m_sparse / 2) * math.pi * y_sparse / width), torch.cos(torch.ceil(m_sparse / 2) * math.pi * y_sparse / width))
+#         harmonic_z = torch.where(p_sparse % 2 == 1, torch.sin(torch.ceil(p_sparse / 2) * math.pi * z_sparse / width), torch.cos(torch.ceil(p_sparse / 2) * math.pi * z_sparse / width))
+
+#         harmonic = harmonic_x * harmonic_y * harmonic_z
+#         vals = self.hann_window(r_sparse, width=width) * harmonic
+
+#         return iidx, vals
+
+        
+class ZernikeFilterBasis(FilterBasis):
+    """
+    Zernike polynomials which are defined on the disk. See https://en.wikipedia.org/wiki/Zernike_polynomials
+    """
+
+    def __init__(
+        self,
+        kernel_shape: Union[int, Tuple[int]],
+    ):
+
+        if isinstance(kernel_shape, tuple) or isinstance(kernel_shape, list):
+            kernel_shape = kernel_shape[0]
+        if not isinstance(kernel_shape, int):
+            raise ValueError(f"expected kernel_shape to be an integer but got {kernel_shape} instead.")
+
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    def kernel_size(self):
+        return (self.kernel_shape * (self.kernel_shape + 1)) // 2
+
+    def zernikeradial(self, r: torch.Tensor, n: torch.Tensor, m: torch.Tensor):
+        out = torch.zeros_like(r)
+        bound = (n - m) // 2 + 1
+        max_bound = bound.max().item()
+
+        for k in range(max_bound):
+
+            inc = (-1) ** k * _factorial(n - k) * r ** (n - 2 * k) / (math.factorial(k) * _factorial((n + m) // 2 - k) * _factorial((n - m) // 2 - k))
+            out += torch.where(k < bound, inc, 0.0)
+
+        return out
+
+    def zernikepoly(self, r: torch.Tensor, phi: torch.Tensor, n: torch.Tensor, l: torch.Tensor):
+        m = 2 * l - n
+        return torch.where(m < 0, self.zernikeradial(r, n, -m) * torch.sin(m * phi), self.zernikeradial(r, n, m) * torch.cos(m * phi))
+
+    def compute_support_vals(self, r: torch.Tensor, phi: torch.Tensor, r_cutoff: float, width: float = 0.25):
+        """
+        Computes the index set that falls into the isotropic kernel's support and returns both indices and values.
+        """
+
+        # enumerator for basis function
+        ikernel = torch.arange(self.kernel_size).reshape(-1, 1, 1)
+
+        # get relevant indices
+        iidx = torch.argwhere((r <= r_cutoff) & torch.full_like(ikernel, True, dtype=torch.bool))
+
+        # indexing logic for zernike polynomials
+        # the total index is given by (n * (n + 2) + l ) // 2 which needs to be reversed
+        # precompute shifts in the level of the "pyramid"
+        nshifts = torch.arange(self.kernel_shape)
+        nshifts = (nshifts + 1) * nshifts // 2
+        # find the level and position within the pyramid
+        nkernel = torch.searchsorted(nshifts, ikernel, right=True) - 1
+        lkernel = ikernel - nshifts[nkernel]
+        # mkernel = 2 * ikernel - nkernel * (nkernel + 2)
+
+        # get corresponding coordinates and n and l indices
+        r = r[iidx[:, 1], iidx[:, 2]] / r_cutoff
+        phi = phi[iidx[:, 1], iidx[:, 2]]
+        n = nkernel[iidx[:, 0], 0, 0]
+        l = lkernel[iidx[:, 0], 0, 0]
+
+        # computes the Zernike polynomials using helper functions
+        vals = self.zernikepoly(r, phi, n, l)
+
+        return iidx, vals
