@@ -9,5 +9,6 @@ from .fnogno import FNOGNO
 from .gino import GINO
 from .codano import CODANO
 from .rno import RNO
+from .local_rno import LocalRNO
 from .otno import OTNO
 from .base_model import get_model
