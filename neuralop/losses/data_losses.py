@@ -159,7 +159,7 @@ class LpLoss(object):
             )
 
         if take_root and self.p != 1:
-            diff = diff ** (1.0 / self.p)
+            diff = (diff + self.eps) ** (1.0 / self.p)
 
         diff = self.reduce_all(diff).squeeze()
 
@@ -194,7 +194,7 @@ class LpLoss(object):
             ynorm = torch.sum(torch.abs(y_flat) ** self.p, dim=-1, keepdim=False)
 
         if take_root and self.p != 1:
-            diff = (diff ** (1.0 / self.p)) / (ynorm ** (1.0 / self.p) + self.eps)
+            diff = ((diff + self.eps) ** (1.0 / self.p)) / (ynorm ** (1.0 / self.p) + self.eps)
         else:
             diff = diff / (ynorm + self.eps)
 
